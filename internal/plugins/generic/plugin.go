@@ -2,6 +2,7 @@ package genericplugin
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,7 +198,14 @@ func replaceAllPatterns(s, prefix, suffix string, repl func(string) string) stri
 	return result
 }
 
+const maxFileSize int64 = 128 * 1024 // 128 KB limit for file inclusion
+
 func readFile(filename string) string {
+	info, err := os.Stat(filename)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
+		return ""
+	}
+
 	ext := strings.ToLower(filepath.Ext(filename))
 
 	if reader, e := codec.GetCodec(ext); e == nil {
@@ -205,13 +213,25 @@ func readFile(filename string) string {
 		if err != nil {
 			return ""
 		}
-		return text
+		return text // No size limit for codec-decoded files
 	}
 
-	data, err := os.ReadFile(filename)
+	if info.Size() > maxFileSize { // Size limit only for non-codec files
+		return ""
+	}
+
+	f, err := os.Open(filename)
 	if err != nil {
 		return ""
 	}
+	defer f.Close()
+
+	lr := io.LimitReader(f, maxFileSize+1)
+	data, err := io.ReadAll(lr)
+	if err != nil || int64(len(data)) > maxFileSize {
+		return ""
+	}
+
 	return string(data)
 }
 
