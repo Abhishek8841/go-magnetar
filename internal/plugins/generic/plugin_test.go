@@ -239,6 +239,60 @@ func TestProcessFilesKeepsPlaceholder(t *testing.T) {
 	}
 }
 
+// A placeholder whose file exceeds maxFileSize stays in the text.
+func TestProcessFilesExceedsLimit(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "large.txt")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if err := f.Truncate(maxFileSize + 1); err != nil {
+		t.Fatal(err)
+	}
+
+	input := fmt.Sprintf("before {{file:%s}} after", path)
+
+	result := processFiles(input)
+	if result != input {
+		t.Errorf("processFiles(%q) = %q, want it unchanged", input, result)
+	}
+}
+
+func TestReadFile(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid file", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "test.txt")
+		writeTestFile(t, path, "some text")
+
+		if got := readFile(path); got != "some text" {
+			t.Errorf("readFile() = %q, want %q", got, "some text")
+		}
+	})
+
+	t.Run("file larger than maxFileSize", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "huge.txt")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if err := f.Truncate(maxFileSize + 1); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := readFile(path); got != "" {
+			t.Errorf("readFile() = %q, want empty string for huge file", got)
+		}
+	})
+}
+
 // An unreadable placeholder must not stop the following ones from
 // being replaced.
 func TestProcessFilesUnreadableThenReadable(t *testing.T) {
