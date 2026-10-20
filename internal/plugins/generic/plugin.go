@@ -92,14 +92,12 @@ func (p *Plugin) Init(s *plugin.State, hub plugin.Hub) error {
 			},
 		})
 	}
-	if _, err := exec.LookPath("date"); err == nil {
-		hub.RegisterTool(plugin.LLMTool{
-			Definition: generic.StaticDefinitionSystemDate,
-			Execute: func(_ context.Context, args string) (string, error) {
-				return p.get().Dispatch("system_date", args), nil
-			},
-		})
-	}
+	hub.RegisterTool(plugin.LLMTool{
+		Definition: generic.StaticDefinitionSystemDate,
+		Execute: func(_ context.Context, args string) (string, error) {
+			return p.get().Dispatch("system_date", args), nil
+		},
+	})
 	p.registerPreprocessor(hub)
 	return nil
 }
