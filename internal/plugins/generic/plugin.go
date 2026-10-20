@@ -198,11 +198,11 @@ func replaceAllPatterns(s, prefix, suffix string, repl func(string) string) stri
 	return result
 }
 
-const maxFileSize int64 = 10 * 1024 * 1024 // 10 MB limit for file inclusion
+const maxFileSize int64 = 128 * 1024 // 128 KB limit for file inclusion
 
 func readFile(filename string) string {
 	info, err := os.Stat(filename)
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxFileSize {
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
 		return ""
 	}
 
@@ -210,10 +210,14 @@ func readFile(filename string) string {
 
 	if reader, e := codec.GetCodec(ext); e == nil {
 		text, err := reader.ReadFile(filename)
-		if err != nil || int64(len(text)) > maxFileSize {
+		if err != nil {
 			return ""
 		}
-		return text
+		return text // No size limit for codec-decoded files
+	}
+
+	if info.Size() > maxFileSize { // Size limit only for non-codec files
+		return ""
 	}
 
 	f, err := os.Open(filename)
