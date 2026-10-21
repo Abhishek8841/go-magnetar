@@ -194,6 +194,14 @@ Reads input from the specified file, sends it to the agent, prints the answer, a
 
 > **Note:** In `-f/--file` mode, text preprocessors are applied but chat commands (e.g., `/readonly`, `/fetch`, `/index`) are not available. The text preprocessor expands placeholders like `{{home}}`, `{{uuid}}`, `{{date}}`, `{{now}}`, and `{{file:filename}}`.
 
+### `--enable-timing` — show execution time
+
+```
+go-magnetar --enable-timing
+```
+
+Prints the execution time after every answer (`— Execution time: 1.234s`). The flag only sets the starting value: the `/timing on|off` chat command still turns the display on and off during the session.
+
 ## Commands
 
 ### Interactive chat

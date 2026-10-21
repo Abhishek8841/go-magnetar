@@ -696,7 +696,9 @@ func (a *ChatAgent) Run(state *plugin.State) error {
 			}
 		}
 
+		start := time.Now()
 		cmdResponse, err := a.handleCommand(line, plugin.ChatCommands())
+		elapsed := time.Since(start)
 		if err == nil {
 			if cmdResponse != nil {
 				if cmdResponse.Exit {
@@ -707,6 +709,7 @@ func (a *ChatAgent) Run(state *plugin.State) error {
 					a.printAnswer(state, cmdResponse.Stdout, cmdResponse.NoLog)
 				}
 				if cmdResponse.Content == "" {
+					printTiming(state, elapsed)
 					continue
 				}
 				line = cmdResponse.Content
@@ -719,7 +722,10 @@ func (a *ChatAgent) Run(state *plugin.State) error {
 			continue
 		}
 
+		// Measured from before the chat command, so a command that hands its
+		// content to the model is counted in the answer's time.
 		answer, err := a.Ask(line)
+		elapsed = time.Since(start)
 		if err != nil {
 			printer.Error("chat: failed to get answer", "err", err)
 			fmt.Fprintln(os.Stdout, "Error: failed to get response. Please try again.")
@@ -727,7 +733,27 @@ func (a *ChatAgent) Run(state *plugin.State) error {
 		}
 
 		a.printAnswer(state, answer, false)
+		printTiming(state, elapsed)
 	}
 
 	return nil
+}
+
+// printTiming prints how long an answer took when /timing or --enable-timing turned it on.
+func printTiming(state *plugin.State, elapsed time.Duration) {
+	if state.TimingEnabled.Load() {
+		fmt.Fprintf(os.Stdout, "— Execution time: %s\n\n", printDuration(elapsed))
+	}
+}
+
+// printDuration renders d rounded to the millisecond, or to the second from 10s up.
+func printDuration(d time.Duration) string {
+	if d >= time.Second*10 {
+		d = d.Round(time.Second)
+		return d.String()
+	} else {
+		d = d.Round(time.Millisecond)
+	}
+
+	return d.String()
 }
