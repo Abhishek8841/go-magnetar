@@ -29,8 +29,9 @@ import (
 )
 
 const (
-	execTimeout       = 1 * time.Minute
-	execOutputMaxSize = 64 * 1024
+	execTimeout         = 1 * time.Minute
+	execOutputMaxSize   = 64 * 1024
+	maxDecompressedSize = 50 * 1024 * 1024 // 50MB limit to prevent decompression bomb DoS (gosec G110)
 )
 
 var blockList = []*regexp.Regexp{
@@ -181,13 +182,18 @@ func (g *GenericTools) readGzip(filename string, f *os.File, br *bufio.Reader, l
 		tmpPath := tmpFile.Name()
 		defer os.Remove(tmpPath)
 
-		_, copyErr := io.Copy(tmpFile, gzReader)
+		limitedReader := io.LimitReader(gzReader, maxDecompressedSize+1)
+		written, copyErr := io.Copy(tmpFile, limitedReader)
 		closeErr := tmpFile.Close()
 		gzCloseErr := gzReader.Close()
 		f.Close()
 
 		if copyErr != nil {
 			printer.Error("file_read: failed to decompress gzip content", "file", filename, "err", copyErr)
+			return "", false
+		}
+		if written > maxDecompressedSize {
+			printer.Error("file_read: decompressed content exceeds size limit", "file", filename, "max_size", maxDecompressedSize)
 			return "", false
 		}
 		if closeErr != nil {
@@ -208,12 +214,17 @@ func (g *GenericTools) readGzip(filename string, f *os.File, br *bufio.Reader, l
 	}
 
 	if limit <= 0 && offset <= 0 {
-		data, readErr := io.ReadAll(gzReader)
+		limitedReader := io.LimitReader(gzReader, maxDecompressedSize+1)
+		data, readErr := io.ReadAll(limitedReader)
 		gzCloseErr := gzReader.Close()
 		f.Close()
 
 		if readErr != nil {
 			printer.Error("file_read: failed to decompress gzip content", "file", filename, "err", readErr)
+			return "", false
+		}
+		if int64(len(data)) > maxDecompressedSize {
+			printer.Error("file_read: decompressed content exceeds size limit", "file", filename, "max_size", maxDecompressedSize)
 			return "", false
 		}
 		if gzCloseErr != nil {
@@ -226,7 +237,7 @@ func (g *GenericTools) readGzip(filename string, f *os.File, br *bufio.Reader, l
 	defer gzReader.Close()
 	defer f.Close()
 
-	scanner := bufio.NewScanner(gzReader)
+	scanner := bufio.NewScanner(io.LimitReader(gzReader, maxDecompressedSize))
 	var sb strings.Builder
 	lineCount := 0
 
