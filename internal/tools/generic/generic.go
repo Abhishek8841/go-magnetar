@@ -2,9 +2,11 @@ package generic
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -146,15 +148,154 @@ func (g *GenericTools) Root() *os.Root {
 	return g.root
 }
 
+// recoverableExtension returns the file extension to use for codec lookup.
+// If the filename ends with .gz (case-insensitive), it inspects the extension before .gz.
+// Otherwise, it returns the extension of the filename.
+func recoverableExtension(filename string) string {
+	lower := strings.ToLower(filename)
+	if strings.HasSuffix(lower, ".gz") {
+		base := filename[:len(filename)-3]
+		return strings.ToLower(filepath.Ext(base))
+	}
+	return strings.ToLower(filepath.Ext(filename))
+}
+
+// readGzip handles reading and decompressing gzip-compressed files.
+func (g *GenericTools) readGzip(filename string, f *os.File, br *bufio.Reader, limit int, offset int) (string, bool) {
+	gzReader, err := gzip.NewReader(br)
+	if err != nil {
+		f.Close()
+		printer.Error("file_read: failed to initialize gzip reader", "file", filename, "err", err)
+		return "", false
+	}
+
+	ext := recoverableExtension(filename)
+	if reader, err := codec.GetCodec(ext); err == nil {
+		tmpFile, err := os.CreateTemp("", "magnetar-*"+ext)
+		if err != nil {
+			gzReader.Close()
+			f.Close()
+			printer.Error("file_read: failed to create temporary file", "file", filename, "err", err)
+			return "", false
+		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+
+		_, copyErr := io.Copy(tmpFile, gzReader)
+		closeErr := tmpFile.Close()
+		gzCloseErr := gzReader.Close()
+		f.Close()
+
+		if copyErr != nil {
+			printer.Error("file_read: failed to decompress gzip content", "file", filename, "err", copyErr)
+			return "", false
+		}
+		if closeErr != nil {
+			printer.Error("file_read: failed to close temporary file", "file", filename, "err", closeErr)
+			return "", false
+		}
+		if gzCloseErr != nil {
+			printer.Error("file_read: failed to close gzip reader", "file", filename, "err", gzCloseErr)
+			return "", false
+		}
+
+		text, err := reader.ReadFile(tmpPath)
+		if err != nil {
+			printer.Error("file_read: failed to read file", "file", filename, "err", err)
+			return "", false
+		}
+		return text, true
+	}
+
+	if limit <= 0 && offset <= 0 {
+		data, readErr := io.ReadAll(gzReader)
+		gzCloseErr := gzReader.Close()
+		f.Close()
+
+		if readErr != nil {
+			printer.Error("file_read: failed to decompress gzip content", "file", filename, "err", readErr)
+			return "", false
+		}
+		if gzCloseErr != nil {
+			printer.Error("file_read: failed to close gzip reader", "file", filename, "err", gzCloseErr)
+			return "", false
+		}
+		return string(data), true
+	}
+
+	defer gzReader.Close()
+	defer f.Close()
+
+	scanner := bufio.NewScanner(gzReader)
+	var sb strings.Builder
+	lineCount := 0
+
+	for scanner.Scan() {
+		lineCount++
+		if lineCount <= offset {
+			continue
+		}
+		if limit > 0 && lineCount > offset+limit {
+			break
+		}
+		if lineCount > offset+1 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(scanner.Text())
+	}
+
+	if err := scanner.Err(); err != nil {
+		printer.Error("file_read: failed to scan file", "file", filename, "err", err)
+		return "", false
+	}
+
+	return sb.String(), true
+}
+
 // FileRead reads a file and returns its content and a success flag.
 // If limit > 0, reads at most limit lines starting from offset line.
 func (g *GenericTools) FileRead(filename string, limit int, offset int) (string, bool) {
 	printer.ToolCall(printer.IconTool, "file_read", "filename", filename)
 
+	if g.root == nil {
+		printer.Error("file_read: root filesystem is not set", "file", filename)
+		return "", false
+	}
+
+	f, err := g.root.Open(filename)
+	if err != nil {
+		printer.Error("file_read: failed to open file", "file", filename, "err", err)
+		return "", false
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		printer.Error("file_read: failed to stat file", "file", filename, "err", err)
+		return "", false
+	}
+	if info.IsDir() {
+		f.Close()
+		printer.Error("file_read: path is a directory", "file", filename)
+		return "", false
+	}
+
+	br := bufio.NewReader(f)
+	header, peekErr := br.Peek(2)
+	hasGzMagic := peekErr == nil && len(header) >= 2 && header[0] == 0x1f && header[1] == 0x8b
+	hasGzExt := strings.HasSuffix(strings.ToLower(filename), ".gz")
+
+	if hasGzMagic || hasGzExt {
+		return g.readGzip(filename, f, br, limit, offset)
+	}
+
+	fName := f.Name()
+	f.Close()
+
 	ext := strings.ToLower(filepath.Ext(filename))
 
 	if reader, err := codec.GetCodec(ext); err == nil {
-		text, err := reader.ReadFile(filename)
+		text, err := reader.ReadFile(fName)
 		if err != nil {
 			printer.Error("file_read: failed to read file", "file", filename, "err", err)
 			return "", false
@@ -171,14 +312,14 @@ func (g *GenericTools) FileRead(filename string, limit int, offset int) (string,
 		return string(data), true
 	}
 
-	f, err := g.root.Open(filename)
+	f2, err := g.root.Open(filename)
 	if err != nil {
 		printer.Error("file_read: failed to open file", "file", filename, "err", err)
 		return "", false
 	}
-	defer f.Close()
+	defer f2.Close()
 
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(f2)
 	var sb strings.Builder
 	lineCount := 0
 
