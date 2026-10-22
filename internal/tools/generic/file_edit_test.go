@@ -286,7 +286,8 @@ func TestOutputDiff_SpecialCharacters(t *testing.T) {
 }
 
 func TestOutputDiff_WithDefaultPrinter(t *testing.T) {
-	t.Parallel()
+	// Note: t.Parallel() is intentionally omitted because this test modifies
+	// the global default printer via printer.SetDefault, which races with other parallel tests.
 
 	// Save original default printer
 	original := printer.GetDefault()

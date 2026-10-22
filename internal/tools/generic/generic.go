@@ -2,9 +2,11 @@ package generic
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -27,8 +29,9 @@ import (
 )
 
 const (
-	execTimeout       = 1 * time.Minute
-	execOutputMaxSize = 64 * 1024
+	execTimeout         = 1 * time.Minute
+	execOutputMaxSize   = 64 * 1024
+	maxDecompressedSize = 50 * 1024 * 1024 // 50MB limit to prevent decompression bomb DoS (gosec G110)
 )
 
 var blockList = []*regexp.Regexp{
@@ -146,15 +149,56 @@ func (g *GenericTools) Root() *os.Root {
 	return g.root
 }
 
-// FileRead reads a file and returns its content and a success flag.
-// If limit > 0, reads at most limit lines starting from offset line.
-func (g *GenericTools) FileRead(filename string, limit int, offset int) (string, bool) {
-	printer.ToolCall(printer.IconTool, "file_read", "filename", filename)
+// recoverableExtension returns the file extension to use for codec lookup.
+// If the filename ends with .gz (case-insensitive), it inspects the extension before .gz.
+// Otherwise, it returns the extension of the filename.
+func recoverableExtension(filename string) string {
+	lower := strings.ToLower(filename)
+	if strings.HasSuffix(lower, ".gz") {
+		base := filename[:len(filename)-3]
+		return strings.ToLower(filepath.Ext(base))
+	}
+	return strings.ToLower(filepath.Ext(filename))
+}
 
-	ext := strings.ToLower(filepath.Ext(filename))
+// isGzip reports whether the reader or filename indicates gzip-compressed content
+// by checking for gzip magic bytes (0x1f 0x8b) or a .gz extension.
+func isGzip(filename string, br *bufio.Reader) bool {
+	header, err := br.Peek(2)
+	hasMagic := err == nil && len(header) >= 2 && header[0] == 0x1f && header[1] == 0x8b
+	hasExt := strings.HasSuffix(strings.ToLower(filename), ".gz")
+	return hasMagic || hasExt
+}
 
+// readGzip handles reading and processing decompressed gzip content from br.
+func (g *GenericTools) readGzip(filename string, br *bufio.Reader, limit int, offset int) (string, bool) {
+	ext := recoverableExtension(filename)
 	if reader, err := codec.GetCodec(ext); err == nil {
-		text, err := reader.ReadFile(filename)
+		tmpFile, err := os.CreateTemp("", "magnetar-*"+ext)
+		if err != nil {
+			printer.Error("file_read: failed to create temporary file", "file", filename, "err", err)
+			return "", false
+		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+
+		limitedReader := io.LimitReader(br, maxDecompressedSize+1)
+		written, copyErr := io.Copy(tmpFile, limitedReader)
+		if closeErr := tmpFile.Close(); closeErr != nil {
+			printer.Error("file_read: failed to close temporary file", "file", filename, "err", closeErr)
+			return "", false
+		}
+
+		if copyErr != nil {
+			printer.Error("file_read: failed to decompress gzip content", "file", filename, "err", copyErr)
+			return "", false
+		}
+		if written > maxDecompressedSize {
+			printer.Error("file_read: decompressed content exceeds size limit", "file", filename, "max_size", maxDecompressedSize)
+			return "", false
+		}
+
+		text, err := reader.ReadFile(tmpPath)
 		if err != nil {
 			printer.Error("file_read: failed to read file", "file", filename, "err", err)
 			return "", false
@@ -163,12 +207,58 @@ func (g *GenericTools) FileRead(filename string, limit int, offset int) (string,
 	}
 
 	if limit <= 0 && offset <= 0 {
-		data, err := g.root.ReadFile(filename)
-		if err != nil {
-			printer.Error("file_read: failed to read file", "file", filename, "err", err)
+		limitedReader := io.LimitReader(br, maxDecompressedSize+1)
+		data, readErr := io.ReadAll(limitedReader)
+		if readErr != nil {
+			printer.Error("file_read: failed to decompress gzip content", "file", filename, "err", readErr)
+			return "", false
+		}
+		if int64(len(data)) > maxDecompressedSize {
+			printer.Error("file_read: decompressed content exceeds size limit", "file", filename, "max_size", maxDecompressedSize)
 			return "", false
 		}
 		return string(data), true
+	}
+
+	limitedReader := &io.LimitedReader{R: br, N: maxDecompressedSize + 1}
+	scanner := bufio.NewScanner(limitedReader)
+	var sb strings.Builder
+	lineCount := 0
+
+	for scanner.Scan() {
+		lineCount++
+		if lineCount <= offset {
+			continue
+		}
+		if limit > 0 && lineCount > offset+limit {
+			break
+		}
+		if lineCount > offset+1 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(scanner.Text())
+	}
+
+	if err := scanner.Err(); err != nil {
+		printer.Error("file_read: failed to scan file", "file", filename, "err", err)
+		return "", false
+	}
+	if limitedReader.N <= 0 {
+		printer.Error("file_read: decompressed content exceeds size limit", "file", filename, "max_size", maxDecompressedSize)
+		return "", false
+	}
+
+	return sb.String(), true
+}
+
+// FileRead reads a file and returns its content and a success flag.
+// If limit > 0, reads at most limit lines starting from offset line.
+func (g *GenericTools) FileRead(filename string, limit int, offset int) (string, bool) {
+	printer.ToolCall(printer.IconTool, "file_read", "filename", filename)
+
+	if g.root == nil {
+		printer.Error("file_read: root filesystem is not set", "file", filename)
+		return "", false
 	}
 
 	f, err := g.root.Open(filename)
@@ -178,7 +268,40 @@ func (g *GenericTools) FileRead(filename string, limit int, offset int) (string,
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
+	br := bufio.NewReader(f)
+	if isGzip(filename, br) {
+		gzReader, err := gzip.NewReader(br)
+		if err != nil {
+			printer.Error("file_read: failed to initialize gzip reader", "file", filename, "err", err)
+			return "", false
+		}
+		defer gzReader.Close()
+
+		br = bufio.NewReader(gzReader)
+		return g.readGzip(filename, br, limit, offset)
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+
+	if reader, err := codec.GetCodec(ext); err == nil {
+		text, err := reader.ReadFile(f.Name())
+		if err != nil {
+			printer.Error("file_read: failed to read file", "file", filename, "err", err)
+			return "", false
+		}
+		return text, true
+	}
+
+	if limit <= 0 && offset <= 0 {
+		data, err := io.ReadAll(br)
+		if err != nil {
+			printer.Error("file_read: failed to read file", "file", filename, "err", err)
+			return "", false
+		}
+		return string(data), true
+	}
+
+	scanner := bufio.NewScanner(br)
 	var sb strings.Builder
 	lineCount := 0
 

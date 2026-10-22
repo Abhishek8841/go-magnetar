@@ -1,6 +1,8 @@
 package generic
 
 import (
+	"bytes"
+	"compress/gzip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -555,5 +557,350 @@ func TestStaticDefinitions(t *testing.T) {
 		t.Errorf("StaticDefinitionFileEditMultiple() required params is not a string slice")
 	} else if len(params) != 2 {
 		t.Errorf("StaticDefinitionFileEditMultiple() required params count = %d, want 2", len(params))
+	}
+}
+
+func gzipCompress(t *testing.T, data []byte) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestFileReadGzipCSV(t *testing.T) {
+	t.Parallel()
+
+	g, rootFS := newTestToolsWithRoot(t)
+
+	csvContent := "name,age\nAlice,30\nBob,25\n"
+	gzData := gzipCompress(t, []byte(csvContent))
+
+	if err := rootFS.WriteFile("data.csv.gz", gzData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	content, ok := g.FileRead("data.csv.gz", 0, 0)
+	if !ok {
+		t.Fatalf("FileRead(data.csv.gz) failed")
+	}
+
+	if !strings.Contains(content, "name") || !strings.Contains(content, "Alice") || !strings.Contains(content, "Bob") {
+		t.Errorf("FileRead(data.csv.gz) unexpected output: %s", content)
+	}
+
+	// Also verify via Dispatch
+	disp := g.Dispatch("file_read", `{"filename":"data.csv.gz"}`)
+	if !strings.Contains(disp, "Alice") {
+		t.Errorf("Dispatch(file_read) unexpected output: %s", disp)
+	}
+}
+
+func TestFileReadGzipPDF(t *testing.T) {
+	t.Parallel()
+
+	g, rootFS := newTestToolsWithRoot(t)
+
+	pdfPath := filepath.Join("..", "..", "codec", "pdf", "testdata", "test.pdf")
+	rawPDF, err := os.ReadFile(pdfPath)
+	if err != nil {
+		t.Fatalf("failed to read test pdf fixture: %v", err)
+	}
+
+	expectedTxtPath := filepath.Join("..", "..", "codec", "pdf", "testdata", "test.txt")
+	expectedTxt, err := os.ReadFile(expectedTxtPath)
+	if err != nil {
+		t.Fatalf("failed to read expected txt fixture: %v", err)
+	}
+
+	gzPDF := gzipCompress(t, rawPDF)
+	if err := rootFS.WriteFile("report.pdf.gz", gzPDF, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	content, ok := g.FileRead("report.pdf.gz", 0, 0)
+	if !ok {
+		t.Fatalf("FileRead(report.pdf.gz) failed")
+	}
+
+	expected := strings.ReplaceAll(string(expectedTxt), "\r\n", "\n")
+	actual := strings.ReplaceAll(content, "\r\n", "\n")
+	if actual != expected {
+		t.Errorf("FileRead(report.pdf.gz) = %q, want %q", actual, expected)
+	}
+}
+
+func TestFileReadUncompressedSupported(t *testing.T) {
+	t.Parallel()
+
+	g, rootFS := newTestToolsWithRoot(t)
+
+	csvContent := "product,price\nApple,1.5\nBanana,0.8\n"
+	if err := rootFS.WriteFile("data.csv", []byte(csvContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	content, ok := g.FileRead("data.csv", 0, 0)
+	if !ok {
+		t.Fatalf("FileRead(data.csv) failed")
+	}
+
+	if !strings.Contains(content, "product") || !strings.Contains(content, "Apple") {
+		t.Errorf("FileRead(data.csv) unexpected output: %s", content)
+	}
+}
+
+func TestFileReadNonGzFilenameWithGzipContent(t *testing.T) {
+	t.Parallel()
+
+	g, rootFS := newTestToolsWithRoot(t)
+
+	csvContent := "city,country\nParis,France\nTokyo,Japan\n"
+	gzData := gzipCompress(t, []byte(csvContent))
+
+	// Note: filename is "table.csv" without .gz extension, but content is gzip compressed
+	if err := rootFS.WriteFile("table.csv", gzData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	content, ok := g.FileRead("table.csv", 0, 0)
+	if !ok {
+		t.Fatalf("FileRead(table.csv with gzip data) failed")
+	}
+
+	if !strings.Contains(content, "Paris") || !strings.Contains(content, "France") {
+		t.Errorf("FileRead(table.csv with gzip data) unexpected output: %s", content)
+	}
+}
+
+func TestFileReadMalformedGzip(t *testing.T) {
+	t.Parallel()
+
+	g, rootFS := newTestToolsWithRoot(t)
+
+	// Case 1: .gz extension with missing/invalid gzip header (plain text pretending to be .gz)
+	if err := rootFS.WriteFile("report.pdf.gz", []byte("plain text with no gzip magic"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content, ok := g.FileRead("report.pdf.gz", 0, 0)
+	if ok {
+		t.Errorf("FileRead(report.pdf.gz with plain text) expected failure, got ok=true: %s", content)
+	}
+
+	// Case 2: .gz extension with empty file (0 bytes)
+	if err := rootFS.WriteFile("empty.csv.gz", []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content, ok = g.FileRead("empty.csv.gz", 0, 0)
+	if ok {
+		t.Errorf("FileRead(empty.csv.gz) expected failure, got ok=true: %s", content)
+	}
+
+	// Case 3: gzip magic bytes with invalid header
+	if err := rootFS.WriteFile("invalid_header.csv.gz", []byte{0x1f, 0x8b, 0xff, 0xff, 0xff}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content, ok = g.FileRead("invalid_header.csv.gz", 0, 0)
+	if ok {
+		t.Errorf("FileRead(invalid_header.csv.gz) expected failure, got ok=true: %s", content)
+	}
+
+	// Case 4: valid header with corrupt body
+	validGz := gzipCompress(t, []byte("col1,col2\nval1,val2\n"))
+	corruptGz := append(validGz[:10], []byte("not valid compressed body")...)
+	if err := rootFS.WriteFile("corrupt_body.csv.gz", corruptGz, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content, ok = g.FileRead("corrupt_body.csv.gz", 0, 0)
+	if ok {
+		t.Errorf("FileRead(corrupt_body.csv.gz) expected failure, got ok=true: %s", content)
+	}
+
+	// Case 5: plain text file with corrupt gzip
+	if err := rootFS.WriteFile("malformed.txt.gz", []byte{0x1f, 0x8b, 0x00, 0x00}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content, ok = g.FileRead("malformed.txt.gz", 0, 0)
+	if ok {
+		t.Errorf("FileRead(malformed.txt.gz) expected failure, got ok=true: %s", content)
+	}
+}
+
+func listTempFilesWithExt(t *testing.T, ext string) []string {
+	t.Helper()
+
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "magnetar-*"+ext))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return matches
+}
+
+func TestFileReadTempFileCleanup(t *testing.T) {
+	g, rootFS := newTestToolsWithRoot(t)
+
+	// 1. Success case: temp file should be removed after successful read
+	tsvContent := "item\tqty\nWidget\t10\n"
+	gzData := gzipCompress(t, []byte(tsvContent))
+	if err := rootFS.WriteFile("cleanup_success.tsv.gz", gzData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeSuccess := listTempFilesWithExt(t, ".tsv")
+	content, ok := g.FileRead("cleanup_success.tsv.gz", 0, 0)
+	if !ok || !strings.Contains(content, "Widget") {
+		t.Fatalf("FileRead(cleanup_success.tsv.gz) failed: %v, ok=%v", content, ok)
+	}
+	afterSuccess := listTempFilesWithExt(t, ".tsv")
+
+	if len(afterSuccess) > len(beforeSuccess) {
+		t.Errorf("leak detected on success: temp file was not removed: %v", afterSuccess)
+	}
+
+	// 2. Failure case (corrupt gzip): temp file should be removed after failed decompression
+	if err := rootFS.WriteFile("cleanup_corrupt.tsv.gz", append(gzData[:10], []byte("corrupt data")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeCorrupt := listTempFilesWithExt(t, ".tsv")
+	_, ok = g.FileRead("cleanup_corrupt.tsv.gz", 0, 0)
+	if ok {
+		t.Errorf("FileRead(cleanup_corrupt.tsv.gz) expected failure, got ok=true")
+	}
+	afterCorrupt := listTempFilesWithExt(t, ".tsv")
+
+	if len(afterCorrupt) > len(beforeCorrupt) {
+		t.Errorf("leak detected on decompression failure: temp file was not removed: %v", afterCorrupt)
+	}
+
+	// 3. Failure case (codec error on decompressed content):
+	// Decompress succeeds, but content is invalid for that format (e.g. invalid DOCX)
+	gzInvalidDocx := gzipCompress(t, []byte("this is not a valid docx file at all"))
+	if err := rootFS.WriteFile("cleanup_codec_err.docx.gz", gzInvalidDocx, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeCodecErr := listTempFilesWithExt(t, ".docx")
+	_, ok = g.FileRead("cleanup_codec_err.docx.gz", 0, 0)
+	if ok {
+		t.Errorf("FileRead(cleanup_codec_err.docx.gz) expected failure, got ok=true")
+	}
+	afterCodecErr := listTempFilesWithExt(t, ".docx")
+
+	if len(afterCodecErr) > len(beforeCodecErr) {
+		t.Errorf("leak detected on codec failure: temp file was not removed: %v", afterCodecErr)
+	}
+}
+
+func TestFileReadPlainTextLimitAndOffset(t *testing.T) {
+	t.Parallel()
+
+	g, rootFS := newTestToolsWithRoot(t)
+
+	text := "line 1\nline 2\nline 3\nline 4\nline 5"
+
+	// Uncompressed test
+	if err := rootFS.WriteFile("lines.txt", []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		limit  int
+		offset int
+		want   string
+	}{
+		{name: "all lines", limit: 0, offset: 0, want: "line 1\nline 2\nline 3\nline 4\nline 5"},
+		{name: "limit 2 offset 0", limit: 2, offset: 0, want: "line 1\nline 2"},
+		{name: "limit 2 offset 2", limit: 2, offset: 2, want: "line 3\nline 4"},
+		{name: "limit 0 offset 3", limit: 0, offset: 3, want: "line 4\nline 5"},
+		{name: "limit 10 offset 1", limit: 10, offset: 1, want: "line 2\nline 3\nline 4\nline 5"},
+	}
+
+	for _, tt := range tests {
+		t.Run("uncompressed_"+tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := g.FileRead("lines.txt", tt.limit, tt.offset)
+			if !ok {
+				t.Fatalf("FileRead failed")
+			}
+			if got != tt.want {
+				t.Errorf("FileRead() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	// Compressed plain-text test
+	gzText := gzipCompress(t, []byte(text))
+	if err := rootFS.WriteFile("lines.txt.gz", gzText, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range tests {
+		t.Run("compressed_"+tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := g.FileRead("lines.txt.gz", tt.limit, tt.offset)
+			if !ok {
+				t.Fatalf("FileRead failed")
+			}
+			if got != tt.want {
+				t.Errorf("FileRead() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFileReadUnrecoverableExtension(t *testing.T) {
+	t.Parallel()
+
+	g, rootFS := newTestToolsWithRoot(t)
+
+	text := "plain text inside abc.gz"
+	gzData := gzipCompress(t, []byte(text))
+
+	if err := rootFS.WriteFile("abc.gz", gzData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := g.FileRead("abc.gz", 0, 0)
+	if !ok {
+		t.Fatalf("FileRead(abc.gz) failed")
+	}
+	if got != text {
+		t.Errorf("FileRead(abc.gz) = %q, want %q", got, text)
+	}
+}
+
+func TestFileReadErrors(t *testing.T) {
+	t.Parallel()
+
+	g, rootFS := newTestToolsWithRoot(t)
+	tmpDir := rootFS.Name()
+
+	// Non-existent file
+	if _, ok := g.FileRead("does_not_exist.txt", 0, 0); ok {
+		t.Errorf("FileRead(does_not_exist.txt) expected failure")
+	}
+
+	// Directory
+	subDir := filepath.Join(tmpDir, "somedir")
+	if err := os.Mkdir(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.FileRead("somedir", 0, 0); ok {
+		t.Errorf("FileRead(somedir) expected failure")
+	}
+
+	// Nil root
+	cfg := g.cfg
+	nilRootTools := New(cfg, nil, g.state)
+	if _, ok := nilRootTools.FileRead("any.txt", 0, 0); ok {
+		t.Errorf("FileRead with nil root expected failure")
 	}
 }
