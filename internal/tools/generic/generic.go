@@ -184,7 +184,10 @@ func (g *GenericTools) readGzip(filename string, br *bufio.Reader, limit int, of
 
 		limitedReader := io.LimitReader(br, maxDecompressedSize+1)
 		written, copyErr := io.Copy(tmpFile, limitedReader)
-		closeErr := tmpFile.Close()
+		if closeErr := tmpFile.Close(); closeErr != nil {
+			printer.Error("file_read: failed to close temporary file", "file", filename, "err", closeErr)
+			return "", false
+		}
 
 		if copyErr != nil {
 			printer.Error("file_read: failed to decompress gzip content", "file", filename, "err", copyErr)
@@ -192,10 +195,6 @@ func (g *GenericTools) readGzip(filename string, br *bufio.Reader, limit int, of
 		}
 		if written > maxDecompressedSize {
 			printer.Error("file_read: decompressed content exceeds size limit", "file", filename, "max_size", maxDecompressedSize)
-			return "", false
-		}
-		if closeErr != nil {
-			printer.Error("file_read: failed to close temporary file", "file", filename, "err", closeErr)
 			return "", false
 		}
 
